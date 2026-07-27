@@ -1,0 +1,1 @@
+{"default":{"identifier":"default","description":"Default permissions for Video Splitter","local":true,"windows":["main"],"permissions":["core:default","dialog:allow-open",{"identifier":"shell:allow-execute","allow":[{"args":true,"name":"binaries/ffmpeg","sidecar":true},{"args":true,"name":"binaries/ffprobe","sidecar":true}]}]}}

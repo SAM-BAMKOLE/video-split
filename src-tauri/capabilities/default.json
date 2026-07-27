@@ -1,0 +1,17 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Default permissions for Video Splitter",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "dialog:allow-open",
+    {
+      "identifier": "shell:allow-execute",
+      "allow": [
+        { "name": "binaries/ffmpeg", "sidecar": true, "args": true },
+        { "name": "binaries/ffprobe", "sidecar": true, "args": true }
+      ]
+    }
+  ]
+}
