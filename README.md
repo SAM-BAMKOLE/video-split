@@ -54,14 +54,21 @@ build on/for each target via CI (GitHub Actions runners for
 windows-latest / macos-latest / ubuntu-latest is the common approach).
 
 ### Licensing note (important, don't skip)
-This app only ever calls `-c copy` — it never encodes anything — so you
-don't need libx264/libx265/etc. Use an **LGPL** ffmpeg build
-(`win64-lgpl` on the BtbN page), not the GPL one. LGPL lets you bundle
-the binary in a closed-source/commercial app without your own app
-becoming subject to GPL. If you ever add re-encoding features that
-require GPL-only codecs, revisit this. Either way, include ffmpeg's
-license file (`LICENSE.txt` from the build) somewhere in your app's
-"About" screen — it's a redistribution requirement even under LGPL.
+**Update:** the crop-for-reels feature re-encodes video with `libx264`,
+which is GPL-licensed — the LGPL build no longer covers this. **Swap the
+bundled ffmpeg/ffprobe binaries to the GPL build**
+(`ffmpeg-master-latest-win64-gpl.zip` on the same BtbN releases page),
+same filenames, same `src-tauri/binaries/` location. This is safe:
+your app calls ffmpeg as a separate external process (not linked into
+your own binary), which is the standard "mere aggregation" pattern —
+it doesn't place your Rust/React code under the GPL. You do still need
+to include ffmpeg's `LICENSE.txt` somewhere accessible (an About screen
+is the usual spot) as a redistribution requirement.
+
+If you only ever use plain splitting (crop toggle off), the LGPL build
+would technically still work for that path — but since crop defaults
+to on now, ship the GPL build so it works out of the box.
+
 
 ## 2. Install prerequisites
 - Node.js 18+
@@ -113,3 +120,73 @@ warning-free.
   that requires OS-level process suspension (`SIGSTOP`/`SIGCONT` on
   Unix; a WinAPI call like `NtSuspendProcess` on Windows) — happy to add
   that if it turns out to matter in practice.
+
+## Dynamic subject tracking (experimental)
+
+The "Follow subject automatically" toggle replaces the fixed crop offset
+with a continuously panning crop that tracks the main detected face
+through the video. This is a much bigger feature than the static crop —
+read this section before relying on it.
+
+### How it works
+1. A fast analysis pass decodes the source at low resolution/framerate
+   (2 fps, 320×240) and runs a tiny ONNX face detector on each sampled
+   frame — this happens once per source video, before any chunk cutting.
+2. Detections are turned into a horizontal-position trajectory over
+   time, gaps are filled by holding the last known position, outlier
+   jumps are clamped, and the result is smoothed (exponential moving
+   average) so the pan looks natural rather than jittery.
+3. For each chunk, that trajectory is sliced to the chunk's time range
+   and written out as an ffmpeg `sendcmd` script — a list of
+   `timestamp → crop x position` lines.
+4. The actual chunk cut still happens in one native ffmpeg encode pass;
+   `sendcmd` just updates the crop filter's `x` parameter live as it
+   processes, so there's no separate frame-by-frame render step.
+
+Only horizontal position is ever tracked or moved. Height and vertical
+position stay exactly as they are for the static crop (full source
+height, always) — this feature only decides *where along the width* the
+crop window sits at each moment.
+
+### Required setup before this works
+1. **Get the model.** Download `version-RFB-320.onnx` from
+   https://github.com/Linzaer/Ultra-Light-Fast-Generic-Face-Detector-1MB
+   (MIT-licensed, ~1.5MB).
+2. **Place it** at `src-tauri/resources/face_detector.onnx` (rename to
+   exactly that).
+3. `tauri.conf.json` already lists it under `bundle.resources`, so a
+   normal `tauri build` packages it into the installer automatically.
+4. **First build note:** the `ort` crate downloads a matching prebuilt
+   ONNX Runtime binary during compilation — this needs internet access
+   on the machine doing the build (not the end user's machine; that
+   binary gets bundled into your output).
+
+### Things to verify once you can actually run it
+I wrote this against the well-documented public spec of this model and
+of ffmpeg's `sendcmd` filter, but couldn't execute either in the
+environment I built this in — a few specifics are worth a quick sanity
+check on your first real run:
+- **Output tensor order.** `tracking.rs` reads the model's two outputs
+  by index (`outputs[0]` = scores, `outputs[1]` = boxes). If detection
+  looks wrong, open the model in [Netron](https://netron.app) and
+  confirm the actual output names/order match.
+- **`sendcmd` targeting syntax.** The filter graph names the crop
+  instance via `crop=...@trackcrop` and targets it in the command file
+  as `trackcrop x <value>`. This is the standard documented pattern for
+  runtime-adjustable filter options, but it's worth a quick one-file
+  test before trusting it on a real batch.
+- **Tuning constants** live at the top of `tracking.rs` if the result
+  needs adjusting:
+  - `SCORE_THRESHOLD` (0.7) — how confident a detection must be to count
+  - `MAX_SPEED_PER_SEC` (0.35) — how fast the crop is allowed to pan,
+    as a fraction of frame width per second (lower = calmer, slower to
+    follow quick movement)
+  - `EMA_ALPHA` (0.25) — smoothing strength (lower = smoother but more
+    "lag" behind the actual subject position)
+  - `SAMPLE_FPS` (2.0) — how often the analysis pass samples frames
+    (higher = more responsive tracking, slower analysis pass)
+
+### Performance
+This adds a full analysis decode pass per source video on top of the
+existing crop re-encode, so total processing time per video will be
+noticeably longer than either plain splitting or the static crop.

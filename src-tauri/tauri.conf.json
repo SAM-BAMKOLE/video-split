@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "VideoSplitter",
-  "version": "0.1.0",
-  "identifier": "com.Bamicole.videosplitter",
+  "version": "0.3.0",
+  "identifier": "com.yourname.videosplitter",
   "build": {
     "beforeDevCommand": "npm run dev",
     "beforeBuildCommand": "npm run build",
@@ -13,10 +13,10 @@
     "windows": [
       {
         "title": "Video Splitter",
-        "width": 640,
-        "height": 560,
-        "minWidth": 480,
-        "minHeight": 520,
+        "width": 1020,
+        "height": 760,
+        "minWidth": 680,
+        "minHeight": 600,
         "resizable": true
       }
     ],
@@ -33,6 +33,7 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "externalBin": ["binaries/ffmpeg", "binaries/ffprobe"]
+    "externalBin": ["binaries/ffmpeg", "binaries/ffprobe"],
+    "resources": ["resources/face_detector.onnx"]
   }
 }

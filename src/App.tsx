@@ -19,9 +19,16 @@ import {
   CheckCircle2,
   XCircle,
   OctagonX,
+  Crop,
+  FileType2,
+  Scissors,
+  RefreshCw,
+  Target,
 } from "lucide-react";
 
 type Status = "running" | "paused" | "done" | "stopped" | "error";
+type Page = "split" | "convert";
+type OutputFormat = "source" | "mp4" | "mov" | "mkv";
 
 type ProgressPayload = {
   file_name: string;
@@ -44,21 +51,42 @@ type JobResult = {
 
 const MAX_SEGMENTS = 40;
 
+const RATIO_PRESETS: { label: string; w: number; h: number }[] = [
+  { label: "4:5", w: 4, h: 5 },
+  { label: "9:16", w: 9, h: 16 },
+  { label: "3:4", w: 3, h: 4 },
+];
+
+const FORMAT_OPTIONS: { label: string; value: OutputFormat; hint: string }[] = [
+  { label: "Same as source", value: "source", hint: "No container change" },
+  { label: "MP4", value: "mp4", hint: "Best for iPhone / CapCut" },
+  { label: "MOV", value: "mov", hint: "Apple-native" },
+  { label: "MKV", value: "mkv", hint: "Original movie-rip style" },
+];
+
 export default function App() {
   const [theme, setTheme] = useState<Theme>(() => {
     const saved = localStorage.getItem("theme");
     if (saved === "light" || saved === "dark") return saved;
-    return window.matchMedia?.("(prefers-color-scheme: light)").matches
-      ? "light"
-      : "dark";
+    return window.matchMedia?.("(prefers-color-scheme: light)").matches ? "light" : "dark";
   });
+
+  const [page, setPage] = useState<Page>("split");
 
   const [inputPath, setInputPath] = useState("");
   const [outputPath, setOutputPath] = useState("");
   const [chunkMinutes, setChunkMinutes] = useState(15);
+  const [cropEnabled, setCropEnabled] = useState(true);
+  const [ratioW, setRatioW] = useState(4);
+  const [ratioH, setRatioH] = useState(5);
+  const [cropOffset, setCropOffset] = useState(0); // -100 (left) .. 0 (center) .. 100 (right)
+  const [dynamicTracking, setDynamicTracking] = useState(false);
+  const [outputFormat, setOutputFormat] = useState<OutputFormat>("mp4");
+
   const [progress, setProgress] = useState<ProgressPayload | null>(null);
   const [isRunning, setIsRunning] = useState(false);
   const [isPaused, setIsPaused] = useState(false);
+  const [isStopping, setIsStopping] = useState(false);
   const [log, setLog] = useState<string[]>([]);
   const [poppedIndex, setPoppedIndex] = useState<number | null>(null);
   const [jobResult, setJobResult] = useState<JobResult | null>(null);
@@ -88,13 +116,23 @@ export default function App() {
       if (p.status === "done") {
         chunksWrittenRef.current += p.chunk_count;
         filesDoneRef.current += 1;
+        if (isLastFile) {
+          setIsRunning(false);
+          setIsPaused(false);
+          setJobResult({
+            status: "done",
+            filesProcessed: filesDoneRef.current,
+            totalChunks: chunksWrittenRef.current,
+          });
+        }
       }
 
-      if ((p.status === "done" || p.status === "stopped") && isLastFile) {
+      if (p.status === "stopped") {
         setIsRunning(false);
         setIsPaused(false);
+        setIsStopping(false);
         setJobResult({
-          status: p.status,
+          status: "stopped",
           filesProcessed: filesDoneRef.current,
           totalChunks: chunksWrittenRef.current,
         });
@@ -102,6 +140,7 @@ export default function App() {
       if (p.status === "error") {
         setIsRunning(false);
         setIsPaused(false);
+        setIsStopping(false);
         setJobResult({
           status: "error",
           filesProcessed: filesDoneRef.current,
@@ -144,12 +183,27 @@ export default function App() {
     filesDoneRef.current = 0;
     setIsRunning(true);
     setIsPaused(false);
+    setIsStopping(false);
     try {
-      await invoke("start_split", {
-        inputPath,
-        outputPath: outputPath || null,
-        chunkMinutes,
-      });
+      if (page === "split") {
+        await invoke("start_split", {
+          inputPath,
+          outputPath: outputPath || null,
+          chunkMinutes,
+          cropEnabled,
+          cropRatioW: ratioW,
+          cropRatioH: ratioH,
+          cropOffsetPercent: cropOffset,
+          dynamicTracking,
+          outputFormat,
+        });
+      } else {
+        await invoke("convert_files", {
+          inputPath,
+          outputPath: outputPath || null,
+          outputFormat,
+        });
+      }
     } catch (e) {
       setLog((prev) => [...prev, `Error — ${e}`]);
       setIsRunning(false);
@@ -167,6 +221,7 @@ export default function App() {
   };
 
   const stop = async () => {
+    setIsStopping(true);
     await invoke("stop_split");
   };
 
@@ -175,10 +230,7 @@ export default function App() {
       ? Math.round((progress.chunk_index / progress.chunk_count) * 100)
       : 0;
 
-  const useSegments =
-    progress &&
-    progress.chunk_count > 0 &&
-    progress.chunk_count <= MAX_SEGMENTS;
+  const useSegments = progress && progress.chunk_count > 0 && progress.chunk_count <= MAX_SEGMENTS;
 
   const statusLabel: Record<Status, string> = {
     running: "Splitting",
@@ -186,6 +238,14 @@ export default function App() {
     done: "Complete",
     stopped: "Stopped",
     error: "Error",
+  };
+
+  const switchPage = (p: Page) => {
+    if (isRunning) return;
+    setPage(p);
+    setJobResult(null);
+    setProgress(null);
+    setLog([]);
   };
 
   return (
@@ -199,9 +259,7 @@ export default function App() {
             </div>
             <div>
               <div className="brand-title">Video Splitter</div>
-              <div className="brand-subtitle">
-                Lossless chunking, sync preserved
-              </div>
+              <div className="brand-subtitle">Lossless chunking, sync preserved</div>
             </div>
           </div>
           <button
@@ -212,6 +270,25 @@ export default function App() {
             {theme === "dark" ? <Sun size={16} /> : <Moon size={16} />}
           </button>
         </header>
+
+        <div className="tabs">
+          <button
+            className={`tab ${page === "split" ? "active" : ""}`}
+            onClick={() => switchPage("split")}
+            disabled={isRunning}
+          >
+            <Scissors size={14} />
+            Split
+          </button>
+          <button
+            className={`tab ${page === "convert" ? "active" : ""}`}
+            onClick={() => switchPage("convert")}
+            disabled={isRunning}
+          >
+            <RefreshCw size={14} />
+            Convert format
+          </button>
+        </div>
 
         <div className="card">
           <div className="card-label">
@@ -225,18 +302,10 @@ export default function App() {
               readOnly
               placeholder="Nothing selected yet"
             />
-            <button
-              className="btn"
-              onClick={pickInputFile}
-              disabled={isRunning}
-            >
+            <button className="btn" onClick={pickInputFile} disabled={isRunning}>
               File
             </button>
-            <button
-              className="btn"
-              onClick={pickInputFolder}
-              disabled={isRunning}
-            >
+            <button className="btn" onClick={pickInputFolder} disabled={isRunning}>
               Folder
             </button>
           </div>
@@ -254,11 +323,7 @@ export default function App() {
               readOnly
               placeholder="Same folder as source"
             />
-            <button
-              className="btn"
-              onClick={pickOutputFolder}
-              disabled={isRunning}
-            >
+            <button className="btn" onClick={pickOutputFolder} disabled={isRunning}>
               <FolderOpen size={14} />
               Folder
             </button>
@@ -267,54 +332,187 @@ export default function App() {
 
         <div className="card">
           <div className="card-label">
-            <Clock size={13} />
-            Chunk length
+            <FileType2 size={13} />
+            Output format
           </div>
-          <div className="stepper">
-            <button
-              className="stepper-btn"
-              onClick={() => setChunkMinutes((m) => Math.max(1, m - 1))}
-              disabled={isRunning || chunkMinutes <= 1}
-              aria-label="Decrease chunk length"
-            >
-              <Minus size={14} />
-            </button>
-            <span className="stepper-value">{chunkMinutes}</span>
-            <span className="stepper-unit">minutes</span>
-            <button
-              className="stepper-btn"
-              onClick={() => setChunkMinutes((m) => m + 1)}
-              disabled={isRunning}
-              aria-label="Increase chunk length"
-            >
-              <Plus size={14} />
-            </button>
+          <div className="format-options">
+            {FORMAT_OPTIONS.map((f) => (
+              <button
+                key={f.value}
+                className={`format-chip ${outputFormat === f.value ? "active" : ""}`}
+                onClick={() => setOutputFormat(f.value)}
+                disabled={isRunning}
+              >
+                <span className="format-chip-label">{f.label}</span>
+                <span className="format-chip-hint">{f.hint}</span>
+              </button>
+            ))}
           </div>
         </div>
 
+        {page === "split" && (
+          <>
+            <div className="card">
+              <div className="card-label">
+                <Clock size={13} />
+                Chunk length
+              </div>
+              <div className="stepper">
+                <button
+                  className="stepper-btn"
+                  onClick={() => setChunkMinutes((m) => Math.max(1, m - 1))}
+                  disabled={isRunning || chunkMinutes <= 1}
+                  aria-label="Decrease chunk length"
+                >
+                  <Minus size={14} />
+                </button>
+                <span className="stepper-value">{chunkMinutes}</span>
+                <span className="stepper-unit">minutes</span>
+                <button
+                  className="stepper-btn"
+                  onClick={() => setChunkMinutes((m) => m + 1)}
+                  disabled={isRunning}
+                  aria-label="Increase chunk length"
+                >
+                  <Plus size={14} />
+                </button>
+              </div>
+            </div>
+
+            <div className="card">
+              <div className="crop-header">
+                <div className="card-label" style={{ marginBottom: 0 }}>
+                  <Crop size={13} />
+                  Crop for reels
+                </div>
+                <label className="switch">
+                  <input
+                    type="checkbox"
+                    checked={cropEnabled}
+                    onChange={(e) => setCropEnabled(e.target.checked)}
+                    disabled={isRunning}
+                  />
+                  <span className="switch-track">
+                    <span className="switch-thumb" />
+                  </span>
+                </label>
+              </div>
+
+              {cropEnabled && (
+                <div className="crop-body">
+                  <div className="ratio-presets">
+                    {RATIO_PRESETS.map((p) => (
+                      <button
+                        key={p.label}
+                        className={`chip ${ratioW === p.w && ratioH === p.h ? "active" : ""}`}
+                        onClick={() => {
+                          setRatioW(p.w);
+                          setRatioH(p.h);
+                        }}
+                        disabled={isRunning}
+                      >
+                        {p.label}
+                      </button>
+                    ))}
+                    <div className="ratio-custom">
+                      <input
+                        type="number"
+                        min={1}
+                        className="ratio-input"
+                        value={ratioW}
+                        disabled={isRunning}
+                        onChange={(e) => setRatioW(Math.max(1, Number(e.target.value)))}
+                      />
+                      <span className="ratio-sep">:</span>
+                      <input
+                        type="number"
+                        min={1}
+                        className="ratio-input"
+                        value={ratioH}
+                        disabled={isRunning}
+                        onChange={(e) => setRatioH(Math.max(1, Number(e.target.value)))}
+                      />
+                    </div>
+                  </div>
+
+                  <div className="tracking-toggle-row">
+                    <div className="tracking-toggle-label">
+                      <Target size={13} />
+                      <span>Follow subject automatically</span>
+                      <span className="beta-tag">Experimental</span>
+                    </div>
+                    <label className="switch">
+                      <input
+                        type="checkbox"
+                        checked={dynamicTracking}
+                        onChange={(e) => setDynamicTracking(e.target.checked)}
+                        disabled={isRunning}
+                      />
+                      <span className="switch-track">
+                        <span className="switch-thumb" />
+                      </span>
+                    </label>
+                  </div>
+
+                  <div className={`offset-row ${dynamicTracking ? "disabled-block" : ""}`}>
+                    <span className="offset-label">
+                      {dynamicTracking
+                        ? "Position follows the subject automatically"
+                        : cropOffset === 0
+                        ? "Centered"
+                        : cropOffset < 0
+                        ? `Left ${Math.abs(cropOffset)}%`
+                        : `Right ${cropOffset}%`}
+                    </span>
+                    <input
+                      type="range"
+                      min={-100}
+                      max={100}
+                      step={5}
+                      value={cropOffset}
+                      disabled={isRunning || dynamicTracking}
+                      onChange={(e) => setCropOffset(Number(e.target.value))}
+                      className="offset-slider"
+                      aria-label="Horizontal crop offset"
+                    />
+                  </div>
+                  <div className="crop-note">
+                    {dynamicTracking
+                      ? "Detects the main subject and pans the crop to keep them in frame as they move — analyzes the video first, so this takes noticeably longer than a fixed crop."
+                      : "Crops the sides only — top and bottom are always kept in full, and nothing is scaled or zoomed."}{" "}
+                    Audio stays a lossless copy; only video is re-encoded.
+                  </div>
+                </div>
+              )}
+            </div>
+          </>
+        )}
+
+        {page === "convert" && (
+          <div className="card">
+            <div className="crop-note" style={{ marginTop: 0 }}>
+              Converts the whole file into the format above — no splitting, no
+              cropping. This is a container remux, not a re-encode, so quality
+              is identical to the source.
+            </div>
+          </div>
+        )}
+
         <div className="controls">
           {!isRunning ? (
-            <button
-              className="btn btn-primary"
-              onClick={start}
-              disabled={!inputPath}
-            >
+            <button className="btn btn-primary" onClick={start} disabled={!inputPath}>
               <Play size={15} fill="currentColor" />
-              {jobResult ? "Split another" : "Start splitting"}
+              {jobResult ? "Run again" : page === "split" ? "Start splitting" : "Start converting"}
             </button>
           ) : (
             <>
-              <button className="btn btn-secondary" onClick={togglePause}>
-                {isPaused ? (
-                  <Play size={14} fill="currentColor" />
-                ) : (
-                  <Pause size={14} />
-                )}
+              <button className="btn btn-secondary" onClick={togglePause} disabled={isStopping}>
+                {isPaused ? <Play size={14} fill="currentColor" /> : <Pause size={14} />}
                 {isPaused ? "Resume" : "Pause"}
               </button>
-              <button className="btn btn-danger" onClick={stop}>
+              <button className="btn btn-danger" onClick={stop} disabled={isStopping}>
                 <Square size={13} fill="currentColor" />
-                Stop
+                {isStopping ? "Stopping…" : "Stop"}
               </button>
             </>
           )}
@@ -334,13 +532,13 @@ export default function App() {
                 {jobResult.status === "error" && "Something went wrong"}
               </div>
               <div className="result-sub">
-                {jobResult.status === "done" &&
+                {jobResult.status === "done" && page === "split" &&
                   `${jobResult.filesProcessed} file${jobResult.filesProcessed === 1 ? "" : "s"} split into ${jobResult.totalChunks} chunk${jobResult.totalChunks === 1 ? "" : "s"}${outputPath ? ` — saved to ${outputPath}` : ""}.`}
+                {jobResult.status === "done" && page === "convert" &&
+                  `${jobResult.filesProcessed} file${jobResult.filesProcessed === 1 ? "" : "s"} converted${outputPath ? ` — saved to ${outputPath}` : ""}.`}
                 {jobResult.status === "stopped" &&
-                  `Stopped after ${jobResult.totalChunks} chunk${jobResult.totalChunks === 1 ? "" : "s"}. What's already cut is saved — the rest wasn't started.`}
-                {jobResult.status === "error" &&
-                  (jobResult.message ||
-                    "Check the activity log below for details.")}
+                  `Stopped after ${jobResult.totalChunks} chunk${jobResult.totalChunks === 1 ? "" : "s"}. What's already done is saved — the rest wasn't started.`}
+                {jobResult.status === "error" && (jobResult.message || "Check the activity log below for details.")}
               </div>
             </div>
           </div>
@@ -361,9 +559,7 @@ export default function App() {
                 <div className="filmstrip-track">
                   {Array.from({ length: progress.chunk_count }).map((_, i) => {
                     const filled = i < progress.chunk_index;
-                    const current =
-                      i === progress.chunk_index &&
-                      progress.status === "running";
+                    const current = i === progress.chunk_index && progress.status === "running";
                     return (
                       <div
                         key={i}
@@ -381,19 +577,16 @@ export default function App() {
                 </div>
               ) : (
                 <div className="progress-bar-track">
-                  <div
-                    className="progress-bar-fill"
-                    style={{ width: `${percent}%` }}
-                  />
+                  <div className="progress-bar-fill" style={{ width: `${percent}%` }} />
                 </div>
               )}
               <div className="sprocket-row" />
             </div>
 
             <div className="progress-status">
-              <span className={`status-dot ${progress.status}`} />
+              <span className={`status-dot ${isStopping ? "paused" : progress.status}`} />
               <span className="status-text">
-                {statusLabel[progress.status]}
+                {isStopping ? "Stopping…" : statusLabel[progress.status]}
               </span>
             </div>
           </div>
@@ -402,8 +595,11 @@ export default function App() {
             <Sparkles size={26} />
             <div className="empty-state-title">Ready when you are</div>
             <div className="empty-state-sub">
-              Pick a video or a folder above, set your chunk length, and hit
-              start. Nothing is re-encoded, so audio stays perfectly in sync.
+              {page === "split"
+                ? cropEnabled
+                  ? "Pick a video or a folder, set your chunk length, and hit start. Audio stays a lossless copy while the video is cropped to your target ratio."
+                  : "Pick a video or a folder, set your chunk length, and hit start. Nothing is re-encoded, so audio stays perfectly in sync."
+                : "Pick a video or a folder and hit start to convert it — a lossless container remux, no chunking."}
             </div>
           </div>
         )}
