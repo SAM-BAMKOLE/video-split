@@ -40,13 +40,18 @@ enum CropMode {
     None,
     /// Fixed crop window for the whole chunk.
     Static(CropRect),
-    /// Crop window that pans over time to follow the tracked subject, via
-    /// an ffmpeg `sendcmd` script.
+    /// Crop window that pans over time to follow the tracked subject, built
+    /// from short trim+crop segments stitched together with ffmpeg's
+    /// concat filter (more reliable across ffmpeg builds than sendcmd,
+    /// which some builds don't actually honor for runtime crop changes).
     Dynamic {
         w: u32,
         h: u32,
-        initial_x: u32,
-        cmd_file: PathBuf,
+        /// Pixels trimmed off the top (see compute_safe_top_crop) — 0
+        /// when there's no safe margin to trim, keeping the previous
+        /// full-height behavior.
+        y_offset: u32,
+        segments: Vec<tracking::CropSegment>,
     },
 }
 
@@ -184,7 +189,7 @@ async fn cut_chunk(
 ) -> Result<(), String> {
     let sidecar = app.shell().sidecar("ffmpeg").map_err(|e| e.to_string())?;
 
-    let mut args: Vec<String> = vec![
+    let input_args: Vec<String> = vec![
         "-y".into(),
         "-ss".into(), start_secs.to_string(),
         "-i".into(), input.to_str().ok_or("Invalid input path")?.to_string(),
@@ -198,12 +203,13 @@ async fn cut_chunk(
         .to_lowercase();
     let is_mp4_family = target_ext == "mp4" || target_ext == "mov" || target_ext == "m4v";
 
-    let mut cwd: Option<PathBuf> = None;
+    let mut filter_args: Vec<String> = Vec::new();
+    let mut codec_args: Vec<String> = Vec::new();
 
     match crop {
         CropMode::Static((w, h, x, y)) => {
-            args.extend([
-                "-vf".into(), format!("crop={w}:{h}:{x}:{y}"),
+            filter_args.extend(["-vf".into(), format!("crop={w}:{h}:{x}:{y}")]);
+            codec_args.extend([
                 "-c:v".into(), "libx264".into(),
                 "-preset".into(), "veryfast".into(),
                 "-crf".into(), "20".into(),
@@ -213,44 +219,72 @@ async fn cut_chunk(
                 "-map".into(), "0:a:0?".into(),
             ]);
         }
-        CropMode::Dynamic { w, h, initial_x, cmd_file } => {
-            // Rather than fight ffmpeg's filter-string escaping rules for
-            // an arbitrary Windows path (drive-letter colon + spaces in
-            // real folder names), sidestep it: run ffmpeg with its cwd set
-            // to this file's folder and reference it by bare filename,
-            // which needs no escaping at all.
-            let cmd_filename = cmd_file
-                .file_name()
-                .and_then(|n| n.to_str())
-                .ok_or("Invalid command file name")?
-                .to_string();
-            cwd = cmd_file.parent().map(PathBuf::from);
+        CropMode::Dynamic { w, h, y_offset, segments } => {
+            // Built from short crop segments stitched with concat, rather
+            // than sendcmd — some ffmpeg builds don't actually apply
+            // sendcmd's runtime parameter changes despite crop being
+            // documented as command-capable, so this sidesteps that
+            // reliability gap. Each segment's crop x is a *linear ramp
+            // expression* toward the next segment's position (using
+            // ffmpeg's native per-frame expression evaluation for crop's
+            // x/y — long-standing core functionality, not the runtime
+            // command mechanism that turned out to be broken) rather than
+            // a flat constant, so motion is genuinely continuous within
+            // and across segments instead of a step function.
+            let mut graph = String::new();
+            for (i, seg) in segments.iter().enumerate() {
+                let duration = (seg.end - seg.start).max(0.01);
+                let next_x = segments.get(i + 1).map(|s| s.x).unwrap_or(seg.x);
+                let x_expr = if next_x == seg.x {
+                    seg.x.to_string()
+                } else {
+                    // Ramps from seg.x at t=0 to next_x at t=duration; t
+                    // here is this segment's own elapsed time (PTS was
+                    // just reset to 0 by setpts=PTS-STARTPTS above).
+                    format!("{}+({}-{})*t/{duration:.3}", seg.x, next_x, seg.x)
+                };
+                graph.push_str(&format!(
+                    "[0:v]trim=start={:.3}:end={:.3},setpts=PTS-STARTPTS,crop={w}:{h}:{x_expr}:{y_offset}[v{i}];",
+                    seg.start, seg.end
+                ));
+            }
+            let labels: String = (0..segments.len()).map(|i| format!("[v{i}]")).collect();
+            graph.push_str(&format!("{labels}concat=n={}:v=1:a=0[vout]", segments.len()));
 
-            args.extend([
-                "-vf".into(),
-                format!("crop@trackcrop={w}:{h}:{initial_x}:0,sendcmd=f={cmd_filename}"),
+            // -filter_complex_script (reading the graph from a file, to
+            // avoid any command-line length limit) turned out to be
+            // rejected as an unrecognized option on at least one recent
+            // ffmpeg nightly build, so this passes the graph inline
+            // instead — tracking.rs now caps segment count per chunk
+            // (MAX_SEGMENTS_PER_CHUNK) specifically so this string can
+            // never grow long enough to hit Windows' process command-line
+            // length limit (which surfaces as the misleading "filename or
+            // extension too long" / OS error 206) in the first place.
+            filter_args.extend(["-filter_complex".into(), graph]);
+
+            codec_args.extend([
                 "-c:v".into(), "libx264".into(),
                 "-preset".into(), "veryfast".into(),
                 "-crf".into(), "20".into(),
                 "-pix_fmt".into(), "yuv420p".into(),
                 "-c:a".into(), "copy".into(),
-                "-map".into(), "0:v:0".into(),
+                "-map".into(), "[vout]".into(),
                 "-map".into(), "0:a:0?".into(),
             ]);
         }
         CropMode::None => {
-            args.extend(["-c".into(), "copy".into()]);
+            codec_args.extend(["-c".into(), "copy".into()]);
             if is_mp4_family {
                 // MP4/MOV can't hold arbitrary subtitle/attachment/data
                 // streams that source containers like MKV often carry —
                 // mapping only video+audio avoids producing a file that's
                 // broken or gets rejected by strict mobile importers.
-                args.extend([
+                codec_args.extend([
                     "-map".into(), "0:v:0".into(),
                     "-map".into(), "0:a:0?".into(),
                 ]);
             } else {
-                args.extend(["-map".into(), "0".into()]);
+                codec_args.extend(["-map".into(), "0".into()]);
             }
         }
     }
@@ -259,16 +293,16 @@ async fn cut_chunk(
         // Puts the metadata (moov atom) at the front of the file instead of
         // the end — several mobile apps (CapCut on iOS included) are picky
         // about this and can fail to import an otherwise-valid MP4 without it.
-        args.extend(["-movflags".into(), "+faststart".into()]);
+        codec_args.extend(["-movflags".into(), "+faststart".into()]);
     }
+
+    let mut args = input_args;
+    args.extend(filter_args);
+    args.extend(codec_args);
     args.push(output.to_str().ok_or("Invalid output path")?.to_string());
 
     let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    let mut command = sidecar.args(arg_refs);
-    if let Some(dir) = cwd {
-        command = command.current_dir(dir);
-    }
-    let (mut rx, child) = command.spawn().map_err(|e| e.to_string())?;
+    let (mut rx, child) = sidecar.args(arg_refs).spawn().map_err(|e| e.to_string())?;
 
     {
         let mut guard = control.current_child.lock().map_err(|e| e.to_string())?;
@@ -341,9 +375,9 @@ async fn split_one_file(
 
     // Static crop dimensions (w,h always the same regardless of offset —
     // only x moves), and for dynamic mode, a full-video smoothed subject
-    // trajectory computed once up front.
+    // trajectory computed once up front, plus a safe top-crop offset.
     let mut static_crop_rect: Option<CropRect> = None;
-    let mut dynamic_dims: Option<(u32, u32)> = None;
+    let mut dynamic_dims: Option<(u32, u32, u32)> = None; // (w, h, y_offset)
     let mut trajectory: Vec<tracking::TrackPoint> = Vec::new();
 
     if let Some(opts) = crop_opts {
@@ -354,7 +388,7 @@ async fn split_one_file(
                 .resource_dir()
                 .map_err(|e| e.to_string())?
                 .join("resources")
-                .join("face_detector.onnx");
+                .join("person_detector.onnx");
             emit_progress(app, ProgressPayload {
                 file_name: file_name.clone(), file_index, file_count,
                 chunk_index: 0, chunk_count, status: "running".into(),
@@ -368,9 +402,13 @@ async fn split_one_file(
                     message: format!("Analyzing subject movement… {}%", (frac * 100.0).round() as u32),
                 });
             }).await?;
+            let y_offset = tracking::compute_safe_top_crop(&raw, src_h);
             trajectory = tracking::smooth_trajectory(&raw);
             let (w, h, _, _) = compute_crop_rect(src_w, src_h, opts);
-            dynamic_dims = Some((w, h));
+            // Trim the safe amount off the top — never scaled, just a
+            // smaller height starting further down.
+            let adjusted_h = h.saturating_sub(y_offset);
+            dynamic_dims = Some((w, adjusted_h, y_offset));
         } else {
             static_crop_rect = Some(compute_crop_rect(src_w, src_h, opts));
         }
@@ -402,22 +440,15 @@ async fn split_one_file(
         let this_len = (duration - start).min(chunk_seconds);
         let out_path = dest_folder.join(format!("{stem}_{:03}.{ext}", i + 1));
 
-        let (crop_mode, cmd_file_to_clean): (CropMode, Option<PathBuf>) =
-            if let Some((w, h)) = dynamic_dims {
-                let (src_w, _src_h) = get_video_dimensions(app, input).await?;
-                let cmd_path = dest_folder.join(format!(".trackcmd_{:03}.txt", i + 1));
-                let initial_x = tracking::write_sendcmd_for_chunk(
-                    &trajectory, start, this_len, src_w, w, &cmd_path,
-                )?;
-                (
-                    CropMode::Dynamic { w, h, initial_x, cmd_file: cmd_path.clone() },
-                    Some(cmd_path),
-                )
-            } else if let Some(rect) = static_crop_rect {
-                (CropMode::Static(rect), None)
-            } else {
-                (CropMode::None, None)
-            };
+        let crop_mode: CropMode = if let Some((w, h, y_offset)) = dynamic_dims {
+            let (src_w, _src_h) = get_video_dimensions(app, input).await?;
+            let segments = tracking::build_crop_segments(&trajectory, start, this_len, src_w, w);
+            CropMode::Dynamic { w, h, y_offset, segments }
+        } else if let Some(rect) = static_crop_rect {
+            CropMode::Static(rect)
+        } else {
+            CropMode::None
+        };
 
         emit_progress(app, ProgressPayload {
             file_name: file_name.clone(), file_index, file_count,
@@ -429,11 +460,7 @@ async fn split_one_file(
             },
         });
 
-        let result = cut_chunk(app, input, &out_path, start, this_len, &crop_mode, control).await;
-        if let Some(cmd_path) = cmd_file_to_clean {
-            let _ = std::fs::remove_file(cmd_path);
-        }
-        result?;
+        cut_chunk(app, input, &out_path, start, this_len, &crop_mode, control).await?;
 
         if control.stop_requested.load(Ordering::SeqCst) {
             emit_progress(app, ProgressPayload {

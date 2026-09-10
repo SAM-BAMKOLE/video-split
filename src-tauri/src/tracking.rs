@@ -1,9 +1,16 @@
 //! Dynamic subject tracking for the crop feature.
 //!
-//! Pipeline: sample low-res frames -> run a tiny ONNX face detector on each
-//! -> build a raw horizontal-position trajectory over time -> reject
+//! Pipeline: sample low-res frames -> run a small ONNX *person* detector on
+//! each -> build a raw horizontal-position trajectory over time -> reject
 //! outliers and smooth it -> write an ffmpeg `sendcmd` script that pans the
 //! crop window to follow the subject.
+//!
+//! v0.4.0 change: switched from a face-only detector to a person detector
+//! (COCO class 0). A face detector loses the subject constantly on this
+//! kind of footage — looking down at notes, turning to address the room,
+//! any angle away from front-on — while a person's bounding box stays
+//! stable through all of that, and naturally covers "abdomen upward"
+//! framing rather than tracking a small floating face.
 //!
 //! Only horizontal position is ever tracked or moved — height and vertical
 //! position are always fixed to the full source frame, matching the
@@ -12,27 +19,29 @@
 use ndarray::Array4;
 use ort::session::Session;
 use ort::value::Value;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use tauri::AppHandle;
 use tauri_plugin_shell::process::CommandEvent;
 use tauri_plugin_shell::ShellExt;
 
-const MODEL_W: usize = 320;
-const MODEL_H: usize = 240;
+// Must be a multiple of 32 (YOLO architecture requirement). 384 is a
+// middle ground between the tiny 320x240 face model's speed and full
+// 640x640 YOLO accuracy — bump to 640 if tracking quality still isn't
+// good enough and you have processing time to spare.
+const MODEL_SIZE: usize = 384;
 const SAMPLE_FPS: f64 = 1.0; // frames analyzed per second of source video
-const SCORE_THRESHOLD: f32 = 0.7;
-const NMS_IOU_THRESHOLD: f32 = 0.3;
+const SCORE_THRESHOLD: f32 = 0.5;
+const COCO_PERSON_CLASS: f32 = 0.0;
 
 #[derive(Clone, Copy, Debug)]
-struct FaceBox {
+struct PersonBox {
     x1: f32,
     y1: f32,
     x2: f32,
     y2: f32,
-    score: f32,
 }
 
-impl FaceBox {
+impl PersonBox {
     fn area(&self) -> f32 {
         (self.x2 - self.x1).max(0.0) * (self.y2 - self.y1).max(0.0)
     }
@@ -41,97 +50,77 @@ impl FaceBox {
     }
 }
 
-fn iou(a: &FaceBox, b: &FaceBox) -> f32 {
-    let ix1 = a.x1.max(b.x1);
-    let iy1 = a.y1.max(b.y1);
-    let ix2 = a.x2.min(b.x2);
-    let iy2 = a.y2.min(b.y2);
-    let inter = (ix2 - ix1).max(0.0) * (iy2 - iy1).max(0.0);
-    let union = a.area() + b.area() - inter;
-    if union <= 0.0 { 0.0 } else { inter / union }
-}
-
-fn nms(mut boxes: Vec<FaceBox>) -> Vec<FaceBox> {
-    boxes.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
-    let mut kept: Vec<FaceBox> = Vec::new();
-    for b in boxes {
-        if kept.iter().all(|k| iou(k, &b) < NMS_IOU_THRESHOLD) {
-            kept.push(b);
-        }
-    }
-    kept
-}
-
 /// One sampled point: seconds into the source video, normalized (0..1)
-/// horizontal center of the chosen subject. `None` x means no face was
+/// horizontal center of the chosen subject, and normalized (0..1) top
+/// edge of their bounding box (used only for the safe top-crop margin —
+/// horizontal tracking never uses this). `None` means no person was
 /// found in that frame.
 #[derive(Clone, Copy, Debug)]
 pub struct TrackPoint {
     pub t: f64,
     pub x_norm: Option<f64>,
+    pub y1_norm: Option<f64>,
 }
 
-/// Run the ONNX face detector on one RGB24 frame already resized to
-/// MODEL_W x MODEL_H. Returns the largest above-threshold face, if any.
-fn detect_main_face(session: &mut Session, rgb: &[u8]) -> Result<Option<FaceBox>, String> {
-    // rgb is MODEL_H * MODEL_W * 3 bytes, HWC, values 0-255.
-    // Build the CHW-normalized tensor data as one flat pass over the pixel
-    // buffer instead of per-element indexed writes into the ndarray — this
-    // avoids repeated bounds-checked multi-dim indexing (Array4's [[..]]
-    // operator), which matters a lot for a loop run tens of thousands of
-    // times per source video.
-    let plane_size = MODEL_W * MODEL_H;
+/// Run the ONNX person detector (YOLO26n, exported with end2end=True so
+/// NMS is already applied inside the model graph) on one RGB24 frame
+/// already resized to MODEL_SIZE x MODEL_SIZE. Returns the largest
+/// above-threshold person, if any.
+fn detect_main_person(session: &mut Session, rgb: &[u8]) -> Result<Option<PersonBox>, String> {
+    // rgb is MODEL_SIZE * MODEL_SIZE * 3 bytes, HWC, values 0-255.
+    // Ultralytics preprocessing: RGB, CHW, normalized to 0..1 (divide by
+    // 255) — no mean subtraction, unlike the previous face model.
+    let plane_size = MODEL_SIZE * MODEL_SIZE;
     let mut chw = vec![0f32; 3 * plane_size];
     for i in 0..plane_size {
         let px = i * 3;
-        chw[i] = (rgb[px] as f32 - 127.0) / 128.0; // R plane
-        chw[plane_size + i] = (rgb[px + 1] as f32 - 127.0) / 128.0; // G plane
-        chw[2 * plane_size + i] = (rgb[px + 2] as f32 - 127.0) / 128.0; // B plane
+        chw[i] = rgb[px] as f32 / 255.0; // R plane
+        chw[plane_size + i] = rgb[px + 1] as f32 / 255.0; // G plane
+        chw[2 * plane_size + i] = rgb[px + 2] as f32 / 255.0; // B plane
     }
-    let tensor = Array4::from_shape_vec((1, 3, MODEL_H, MODEL_W), chw)
+    let tensor = Array4::from_shape_vec((1, 3, MODEL_SIZE, MODEL_SIZE), chw)
         .map_err(|e| e.to_string())?;
 
     let input = Value::from_array(tensor).map_err(|e| e.to_string())?;
     let outputs = session
-        .run(ort::inputs!["input" => input])
+        .run(ort::inputs!["images" => input])
         .map_err(|e| e.to_string())?;
 
-    // NOTE: output tensor order/names come from the exported UltraFace
-    // ONNX graph (typically "scores" then "boxes", already NMS-ready
-    // in normalized 0..1 coordinates). If your exported model differs,
-    // check the actual output names with Netron and adjust the two
-    // indices below.
-    let scores = outputs[0]
-        .try_extract_tensor::<f32>()
-        .map_err(|e| e.to_string())?;
-    let boxes = outputs[1]
-        .try_extract_tensor::<f32>()
-        .map_err(|e| e.to_string())?;
+    // NOTE: an end2end-exported YOLO model outputs a single tensor shaped
+    // (1, max_detections, 6) = [x1, y1, x2, y2, confidence, class_id],
+    // already NMS-filtered, coordinates in the model's input pixel space
+    // (0..MODEL_SIZE). If your export differs, check the actual output
+    // name/shape with Netron and adjust here — the input name ("images")
+    // is Ultralytics' standard, but double-check that too.
+    let (shape, data) = outputs[0].try_extract_tensor::<f32>().map_err(|e| e.to_string())?;
+    let num_dets = shape[1] as usize;
 
-    let (scores_shape, scores_data) = scores;
-    let (_boxes_shape, boxes_data) = boxes;
-    let num_priors = scores_shape[1] as usize;
-
-    let mut candidates = Vec::new();
-    for i in 0..num_priors {
-        let face_score = scores_data[i * 2 + 1]; // index 1 = face class
-        if face_score >= SCORE_THRESHOLD {
-            candidates.push(FaceBox {
-                x1: boxes_data[i * 4],
-                y1: boxes_data[i * 4 + 1],
-                x2: boxes_data[i * 4 + 2],
-                y2: boxes_data[i * 4 + 3],
-                score: face_score,
-            });
+    let mut best: Option<PersonBox> = None;
+    for i in 0..num_dets {
+        let base = i * 6;
+        let confidence = data[base + 4];
+        let class_id = data[base + 5];
+        if confidence < SCORE_THRESHOLD || (class_id - COCO_PERSON_CLASS).abs() > 0.5 {
+            continue;
+        }
+        let candidate = PersonBox {
+            x1: data[base],
+            y1: data[base + 1],
+            x2: data[base + 2],
+            y2: data[base + 3],
+        };
+        // Largest person = assumed main subject (closest/most prominent
+        // speaker vs. anyone else visible in frame, e.g. a sign-language
+        // interpreter or someone crossing the stage in the background).
+        if best.map_or(true, |b: PersonBox| candidate.area() > b.area()) {
+            best = Some(candidate);
         }
     }
 
-    let kept = nms(candidates);
-    // Largest face = assumed main subject (closest/most prominent speaker).
-    Ok(kept.into_iter().max_by(|a, b| a.area().partial_cmp(&b.area()).unwrap()))
+    Ok(best)
 }
 
-/// Decode the source video at a low sample rate/resolution and run face
+/// Decode the source video at a low sample rate/resolution and run person
 /// detection on each sampled frame, returning a raw (possibly gappy)
 /// trajectory of normalized horizontal subject position over time.
 pub async fn sample_and_track(
@@ -150,7 +139,7 @@ pub async fn sample_and_track(
     let (mut rx, _child) = sidecar
         .args([
             "-i", input.to_str().ok_or("Invalid input path")?,
-            "-vf", &format!("fps={SAMPLE_FPS},scale={MODEL_W}:{MODEL_H}"),
+            "-vf", &format!("fps={SAMPLE_FPS},scale={MODEL_SIZE}:{MODEL_SIZE}"),
             "-f", "rawvideo",
             "-pix_fmt", "rgb24",
             "-",
@@ -158,7 +147,7 @@ pub async fn sample_and_track(
         .spawn()
         .map_err(|e| e.to_string())?;
 
-    let frame_bytes = MODEL_W * MODEL_H * 3;
+    let frame_bytes = MODEL_SIZE * MODEL_SIZE * 3;
     let mut buffer: Vec<u8> = Vec::with_capacity(frame_bytes * 4);
     let mut points: Vec<TrackPoint> = Vec::new();
     let mut frame_index: usize = 0;
@@ -174,10 +163,14 @@ pub async fn sample_and_track(
                 if t > duration_secs {
                     break;
                 }
-                let face = detect_main_face(&mut session, &frame)?;
+                let person = detect_main_person(&mut session, &frame)?;
                 points.push(TrackPoint {
                     t,
-                    x_norm: face.map(|f| f.center_x() as f64),
+                    // This model's boxes are in pixel space (0..MODEL_SIZE),
+                    // unlike the previous face model's pre-normalized
+                    // output — normalize to a 0..1 fraction here.
+                    x_norm: person.map(|p| (p.center_x() / MODEL_SIZE as f32) as f64),
+                    y1_norm: person.map(|p| (p.y1 / MODEL_SIZE as f32) as f64),
                 });
                 frame_index += 1;
 
@@ -255,7 +248,7 @@ pub fn smooth_trajectory(raw: &[TrackPoint]) -> Vec<TrackPoint> {
 
     raw.iter()
         .zip(smoothed)
-        .map(|(p, x)| TrackPoint { t: p.t, x_norm: Some(x) })
+        .map(|(p, x)| TrackPoint { t: p.t, x_norm: Some(x), y1_norm: p.y1_norm })
         .collect()
 }
 
@@ -267,26 +260,121 @@ pub fn smooth_trajectory(raw: &[TrackPoint]) -> Vec<TrackPoint> {
 /// points at a much finer step makes the motion read as continuous.
 const INTERP_STEP_SECS: f64 = 0.1;
 
-/// Slice a full-video trajectory down to one chunk's time range and
-/// re-base timestamps to start at 0 (matching how -ss resets PTS for the
-/// cut chunk), then write an ffmpeg `sendcmd` script that pans a filter
-/// named `trackcrop`'s `x` parameter to follow the smoothed trajectory.
-/// The trajectory itself is only known at SAMPLE_FPS resolution, so this
-/// linearly interpolates between consecutive points to produce a much
-/// denser command list — that's what makes the resulting pan look like a
-/// continuous follow rather than a once-a-second jump.
-///
-/// Returns the initial x pixel offset (for the filter's starting value)
-/// and the path to the generated command file.
-pub fn write_sendcmd_for_chunk(
+/// A new segment starts once the crop position has drifted this many
+/// pixels from the current segment's position. The underlying trajectory
+/// is already smooth (zero-phase filtered), so a tight threshold here
+/// traces that smooth curve with many small steps — which reads as a
+/// continuous, natural pan rather than a handful of abrupt jumps. Raise
+/// this if you'd rather trade smoothness for fewer segments/faster
+/// encoding; lower it for an even smoother (but heavier) pan.
+const SEGMENT_PIXEL_THRESHOLD: f64 = 4.0;
+
+/// Even if the subject barely moves, force a new segment at least this
+/// often, so a very long still stretch doesn't collapse into one giant
+/// segment (kept moderate since a tight pixel threshold above already
+/// does most of the work during real movement).
+const MAX_SEGMENT_SECS: f64 = 2.0;
+
+/// How much clearance to keep above the highest observed head position,
+/// as a fraction of source height — the crop line sits this far above
+/// the head, never closer.
+const TOP_CROP_SAFETY_MARGIN: f64 = 0.08;
+
+/// Hard cap on how much can ever be trimmed off the top, as a fraction of
+/// source height — keeps this a modest trim rather than a major reframe,
+/// even if the subject spends the whole video near the bottom of frame.
+const TOP_CROP_MAX_FRACTION: f64 = 0.18;
+
+/// Work out how many pixels can safely be trimmed off the top of the
+/// frame without ever cropping into the subject's head. Uses the RAW
+/// (unsmoothed) trajectory deliberately — smoothing could average away a
+/// single brief moment where the head reached unusually high (e.g. a
+/// hand raised overhead moment or upright the head visibly moving up),
+/// and this needs to stay safe even in that case, not just on average.
+pub fn compute_safe_top_crop(raw: &[TrackPoint], src_h: u32) -> u32 {
+    let min_y1_norm = raw
+        .iter()
+        .filter_map(|p| p.y1_norm)
+        .fold(f64::INFINITY, f64::min);
+
+    if !min_y1_norm.is_finite() {
+        // No person ever detected — don't guess, trim nothing.
+        return 0;
+    }
+
+    let highest_head_px = min_y1_norm * src_h as f64;
+    let margin_px = TOP_CROP_SAFETY_MARGIN * src_h as f64;
+    let safe_crop_px = (highest_head_px - margin_px).max(0.0);
+    let max_allowed_px = TOP_CROP_MAX_FRACTION * src_h as f64;
+
+    safe_crop_px.min(max_allowed_px).floor() as u32
+}
+
+/// Hard ceiling on segments per chunk, regardless of how much the subject
+/// moves. Each segment adds roughly 90-110 characters to the ffmpeg
+/// filter graph string; staying under this keeps that string comfortably
+/// within Windows' process command-line length limit (which surfaces as
+/// the misleading "filename or extension too long" / OS error 206 if
+/// exceeded) even in the worst case of near-continuous fast movement.
+const MAX_SEGMENTS_PER_CHUNK: usize = 220;
+
+fn segment_with_threshold(
+    x_px_at: &dyn Fn(f64) -> u32,
+    chunk_len: f64,
+    pixel_threshold: f64,
+) -> Vec<CropSegment> {
+    let mut segments: Vec<CropSegment> = Vec::new();
+    let mut seg_start = 0.0;
+    let mut seg_x = x_px_at(0.0);
+    let mut local_t = INTERP_STEP_SECS;
+
+    while local_t < chunk_len {
+        let candidate_x = x_px_at(local_t);
+        let drifted = (candidate_x as f64 - seg_x as f64).abs() >= pixel_threshold;
+        let too_long = local_t - seg_start >= MAX_SEGMENT_SECS;
+        if drifted || too_long {
+            segments.push(CropSegment { start: seg_start, end: local_t, x: seg_x });
+            seg_start = local_t;
+            seg_x = candidate_x;
+        }
+        local_t += INTERP_STEP_SECS;
+    }
+    segments.push(CropSegment { start: seg_start, end: chunk_len, x: seg_x });
+    segments
+}
+
+/// One piece of a chunk: [start, end) in chunk-local seconds, with a fixed
+/// crop x position for that span.
+pub struct CropSegment {
+    pub start: f64,
+    pub end: f64,
+    pub x: u32,
+}
+
+/// Slice a full-video trajectory down to one chunk's time range and turn
+/// it into a list of short segments, each with its own fixed crop x
+/// position. Segments only split where the tracked position actually
+/// drifts meaningfully, so a mostly-still subject produces few segments
+/// while real movement produces more, closely-spaced ones — the caller
+/// stitches these back together with ffmpeg's trim+crop+concat filters,
+/// which (unlike `sendcmd`) reliably changes crop position mid-encode.
+/// If the natural (finest) segmentation would exceed
+/// `MAX_SEGMENTS_PER_CHUNK`, the threshold is progressively coarsened
+/// until it fits — this guarantees a hard bound on the resulting filter
+/// graph's size no matter how much the subject moves.
+pub fn build_crop_segments(
     full_trajectory: &[TrackPoint],
     chunk_start: f64,
     chunk_len: f64,
     src_w: u32,
     out_w: u32,
-    cmd_path: &PathBuf,
-) -> Result<u32, String> {
+) -> Vec<CropSegment> {
     let max_x = src_w.saturating_sub(out_w) as f64;
+    if max_x < 1.0 {
+        eprintln!(
+            "[tracking] Warning: crop width ({out_w}px) leaves no margin to pan within source width ({src_w}px) — tracking will have no visible effect for this chunk. This usually means the source is already narrower than or equal to the target crop ratio (e.g. testing against an already-cropped file)."
+        );
+    }
 
     let x_norm_at = |abs_t: f64| -> f64 {
         if full_trajectory.is_empty() {
@@ -301,27 +389,26 @@ pub fn write_sendcmd_for_chunk(
         x0 + (x1 - x0) * frac
     };
 
-    let mut lines = String::new();
-    let mut first_x: Option<u32> = None;
-
-    let mut local_t = 0.0;
-    while local_t <= chunk_len {
-        let abs_t = chunk_start + local_t;
-        let x_norm = x_norm_at(abs_t);
+    let x_px_at = move |local_t: f64| -> u32 {
+        let x_norm = x_norm_at(chunk_start + local_t);
         let center_px = x_norm * src_w as f64;
-        let x_px = (center_px - out_w as f64 / 2.0).clamp(0.0, max_x).round() as u32;
-        if first_x.is_none() {
-            first_x = Some(x_px);
-        }
-        lines.push_str(&format!("{local_t:.3} trackcrop x {x_px};\n"));
-        local_t += INTERP_STEP_SECS;
+        (center_px - out_w as f64 / 2.0).clamp(0.0, max_x).round() as u32
+    };
+
+    let mut threshold = SEGMENT_PIXEL_THRESHOLD;
+    let mut segments = segment_with_threshold(&x_px_at, chunk_len, threshold);
+    let mut attempts = 0;
+    while segments.len() > MAX_SEGMENTS_PER_CHUNK && attempts < 20 {
+        threshold *= 1.5;
+        segments = segment_with_threshold(&x_px_at, chunk_len, threshold);
+        attempts += 1;
+    }
+    if attempts > 0 {
+        eprintln!(
+            "[tracking] Coarsened crop segmentation ({} segments would have exceeded the safety cap) — threshold raised to {threshold:.1}px for this chunk to keep the filter graph a safe size.",
+            MAX_SEGMENTS_PER_CHUNK
+        );
     }
 
-    let initial_x = first_x.unwrap_or((max_x / 2.0).round() as u32);
-    if lines.is_empty() {
-        lines.push_str(&format!("0.0 trackcrop x {initial_x};\n"));
-    }
-
-    std::fs::write(cmd_path, lines).map_err(|e| e.to_string())?;
-    Ok(initial_x)
+    segments
 }
